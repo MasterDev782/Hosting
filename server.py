@@ -1,48 +1,85 @@
-# server.py for Render
+# server.py on Render (with IP Lock)
 
 from flask import Flask, request, jsonify
 import os
 import requests
+import time
 
 app = Flask(__name__)
 
-# These secrets are loaded from the Render environment
+# --- Load secrets from environment variables ---
 CRYPTOLENS_TOKEN = os.environ.get("CRYPTOLENS_TOKEN")
 PRODUCT_ID = os.environ.get("PRODUCT_ID")
 ORBITAL_API_KEY = os.environ.get("ORBITAL_API_KEY")
 
-CRYPTOLENS_API_URL = "https://api.cryptolens.io/api/key/activate"
+# --- Simple in-memory store for IP-locked sessions ---
+# Format: { "hwid": ("ip_address", expiry_timestamp) }
+active_sessions = {}
 
+# --- NEW ENDPOINT to initiate a session ---
+@app.route("/request_session", methods=["POST"])
+def request_session():
+    hwid = request.json.get("machine_code")
+    if not hwid:
+        return jsonify({"status": "error", "message": "HWID required."}), 400
+
+    # Get the client's public IP address. Render provides this in the headers.
+    # The 'X-Forwarded-For' header is standard for this.
+    client_ip = request.headers.get('X-Forwarded-For', request.remote_addr)
+    
+    # Set expiry for 60 seconds from now
+    expiry = time.time() + 60
+    
+    # Store the session, locking the HWID to the current IP
+    active_sessions[hwid] = (client_ip, expiry)
+    
+    # Tell the client it's okay to proceed
+    return jsonify({"status": "success", "message": "Session initiated."})
+
+
+# --- UPDATED /validate ENDPOINT ---
 @app.route("/validate", methods=["POST"])
 def validate_license():
-    if not all([CRYPTOLENS_TOKEN, PRODUCT_ID, ORBITAL_API_KEY]):
-        return jsonify({ "status": "error", "message": "Backend server is not configured correctly." }), 500
-
     license_key = request.json.get("license_key")
-    machine_code = request.json.get("machine_code")
+    hwid = request.json.get("machine_code")
+    
+    # Get the IP of the machine making THIS request
+    current_request_ip = request.headers.get('X-Forwarded-For', request.remote_addr)
 
-    if not license_key or not machine_code:
-        return jsonify({ "status": "error", "message": "License key or machine ID not provided." }), 400
+    # --- THE NEW IP-LOCK CHECK ---
+    if hwid not in active_sessions:
+        return jsonify({"status": "error", "message": "No active session. Please restart."}), 400
 
+    stored_ip, expiry_time = active_sessions[hwid]
+
+    if time.time() > expiry_time:
+        del active_sessions[hwid] # Clean up expired session
+        return jsonify({"status": "error", "message": "Session expired. Please restart."}), 400
+        
+    if stored_ip != current_request_ip:
+        # IPs do not match! This is a potential replay attack.
+        del active_sessions[hwid] # Invalidate the session
+        return jsonify({"status": "error", "message": "IP mismatch. Security check failed."}), 403
+
+    # If we get here, the IP lock is valid.
+    # We can now consume the session so it can't be used again for another /validate call.
+    del active_sessions[hwid]
+
+    # --- PROCEED WITH THE ORIGINAL CRYPTOLENS CHECK ---
     payload = {
         "token": CRYPTOLENS_TOKEN,
         "ProductId": PRODUCT_ID,
         "Key": license_key,
-        "MachineCode": machine_code
+        "MachineCode": hwid
     }
-
     try:
-        response = requests.post(CRYPTOLENS_API_URL, data=payload)
+        response = requests.post("https://api.cryptolens.io/api/key/activate", data=payload)
         response.raise_for_status()
         data = response.json()
-
         if data.get("result") != 0:
             return jsonify({ "status": "error", "message": data.get("message", "Invalid key or machine.") }), 403
         
-        return jsonify({ "status": "success", "api_key": ORBITAL_API_KEY })
-
+        # We don't need to return the API key if the goal is only to protect the app startup
+        return jsonify({ "status": "success" })
     except Exception as e:
         return jsonify({ "status": "error", "message": f"An unexpected server error occurred: {e}" }), 500
-
-# Render needs this to run with Gunicorn
-# No need for an if __name__ == "__main__": block
