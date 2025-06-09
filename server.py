@@ -92,9 +92,7 @@ def validate_license():
         if data.get("result") != 0:
             return jsonify({ "status": "error", "message": data.get("message", "Invalid key or machine.") }), 403
         
-        # In this new model, the server only needs to say "yes" or "no".
-        # It no longer needs to send back an API key.
-        return jsonify({ "status": "success", "message": "Validation successful." })
+        return jsonify({ "status": "success", "api_key": ORBITAL_API_KEY })
 
     except Exception as e:
         return jsonify({ "status": "error", "message": f"An unexpected server error occurred: {e}" }), 500
